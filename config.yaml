@@ -12,9 +12,12 @@ gamma_url: "https://gamma-api.polymarket.com"
 
 # Scanning
 scanning:
-  poll_interval_sec: 1.0      # How often to scan (seconds)
+  poll_interval_sec: 1.0      # How often to poll via HTTP (fallback)
   market_refresh_sec: 120.0   # How often to refresh market list
   max_markets: 5000           # Maximum markets to track
+  use_websocket: true         # Enable WebSocket for near-zero latency
+  ws_url: "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+  ws_reconnect_delay_sec: 2.0 # Reconnect delay on WS disconnect
 
 # Arbitrage detection
 arbitrage:

@@ -1,4 +1,4 @@
-"""Market scanner — discovers markets and polls order books."""
+"""Market scanner — discovers markets and polls/streams order books."""
 
 from __future__ import annotations
 
@@ -15,7 +15,12 @@ logger = logging.getLogger(__name__)
 
 
 class MarketScanner:
-    """Scans Polymarket for active events and fetches order books."""
+    """Scans Polymarket for active events and fetches order books.
+
+    Supports two modes:
+    - HTTP polling (fallback): fetches order books every poll_interval_sec
+    - WebSocket streaming (primary): receives real-time updates via WS
+    """
 
     def __init__(self, client: PolymarketClient, config: Config):
         self.client = client
@@ -26,6 +31,20 @@ class MarketScanner:
         self._last_market_refresh = 0.0
         self.scan_count = 0
         self.total_tokens_tracked = 0
+
+        # WebSocket integration
+        self.ws_client = None
+        self.ws_mirror = None
+        self._ws_mode = False
+
+        # Latency tracking
+        self.last_scan_latency_ms = 0.0
+
+    def set_ws_client(self, ws_client, mirror):
+        """Attach a WebSocket client and order book mirror."""
+        self.ws_client = ws_client
+        self.ws_mirror = mirror
+        self._ws_mode = True
 
     async def refresh_markets(self):
         """Fetch and categorize all active markets."""
@@ -51,10 +70,32 @@ class MarketScanner:
             f"{len(self.binary_events)} binary markets"
         )
 
+        # If WS mode, subscribe to all tracked tokens
+        if self._ws_mode and self.ws_client:
+            all_tokens = []
+            for event in self.events:
+                for outcome in event.outcomes:
+                    all_tokens.append(outcome.token_id)
+            await self.ws_client.subscribe(all_tokens)
+            logger.info(f"Subscribed to {len(all_tokens)} tokens via WebSocket")
+
     async def fetch_event_books(
         self, event: EventMarket
     ) -> dict[str, OrderBookSnapshot]:
         """Fetch order books for all outcomes of an event."""
+        # If WS mirror has data, use it (near-zero latency)
+        if self._ws_mode and self.ws_mirror:
+            token_ids = [o.token_id for o in event.outcomes]
+            mirror_books = self.ws_mirror.get_all(token_ids)
+            # Check if we have all tokens and they're not stale
+            if len(mirror_books) == len(token_ids):
+                all_fresh = all(
+                    not self.ws_mirror.is_stale(tid) for tid in token_ids
+                )
+                if all_fresh:
+                    return mirror_books
+
+        # Fallback to HTTP fetch
         token_ids = [o.token_id for o in event.outcomes]
         return await self.client.get_order_books_batch(token_ids)
 
@@ -62,6 +103,7 @@ class MarketScanner:
         self,
     ) -> list[tuple[EventMarket, dict[str, OrderBookSnapshot]]]:
         """Run a single scan cycle. Returns events with their order books."""
+        start = time.monotonic()
         now = time.time()
 
         # Refresh market list if stale
@@ -92,6 +134,7 @@ class MarketScanner:
                     logger.error(f"Error scanning binary {event.event_id}: {e}")
 
         self.scan_count += 1
+        self.last_scan_latency_ms = (time.monotonic() - start) * 1000
         return results
 
     async def run_loop(
@@ -102,26 +145,90 @@ class MarketScanner:
         ],
     ):
         """Main scanning loop. Calls on_scan with results each cycle."""
+        mode = "WebSocket + polling" if self._ws_mode else "HTTP polling"
         logger.info(
-            f"Scanner starting — polling every {self.config.scanning.poll_interval_sec}s"
+            f"Scanner starting — {mode}, "
+            f"poll every {self.config.scanning.poll_interval_sec}s"
         )
 
         while True:
             try:
-                start = time.monotonic()
                 results = await self.scan_once()
                 await on_scan(results)
-                elapsed = time.monotonic() - start
 
                 # Sleep for remaining interval
-                sleep_time = max(
-                    0, self.config.scanning.poll_interval_sec - elapsed
-                )
-                if sleep_time > 0:
-                    await asyncio.sleep(sleep_time)
+                await asyncio.sleep(self.config.scanning.poll_interval_sec)
             except asyncio.CancelledError:
                 logger.info("Scanner loop cancelled")
                 break
             except Exception as e:
                 logger.error(f"Scanner error: {e}", exc_info=True)
-                await asyncio.sleep(5)  # Back off on error
+                await asyncio.sleep(5)
+
+    async def run_ws_event_loop(
+        self,
+        on_scan: Callable[
+            [list[tuple[EventMarket, dict[str, OrderBookSnapshot]]]],
+            Awaitable[None],
+        ],
+    ):
+        """WebSocket-driven event loop — triggers arb detection on every update.
+
+        This provides near-zero latency: instead of polling every 1s, we
+        re-evaluate opportunities whenever any order book changes.
+        """
+        if not self._ws_mode or not self.ws_client:
+            logger.warning("WS event loop called without WS client, falling back to polling")
+            await self.run_loop(on_scan)
+            return
+
+        logger.info("WS event loop starting — detecting arbs on every order book update")
+
+        # Debounce: batch updates that arrive within 50ms
+        pending_tokens: set[str] = set()
+        last_process = time.monotonic()
+        debounce_sec = 0.05  # 50ms debounce
+
+        async def on_ws_update(token_id: str):
+            nonlocal last_process
+            pending_tokens.add(token_id)
+            now = time.monotonic()
+            if now - last_process < debounce_sec:
+                return
+            last_process = now
+
+            # Find events affected by this token update
+            affected_events = []
+            for event in self.events:
+                for outcome in event.outcomes:
+                    if outcome.token_id in pending_tokens:
+                        affected_events.append(event)
+                        break
+
+            if not affected_events:
+                pending_tokens.clear()
+                return
+
+            # Build results from WS mirror
+            results = []
+            for event in affected_events:
+                token_ids = [o.token_id for o in event.outcomes]
+                books = self.ws_mirror.get_all(token_ids)
+                if len(books) == len(token_ids):
+                    results.append((event, books))
+
+            if results:
+                self.scan_count += 1
+                await on_scan(results)
+
+            pending_tokens.clear()
+
+        # Set the callback on the WS client
+        self.ws_client.on_update = on_ws_update
+
+        # Keep running (the WS client drives events)
+        try:
+            while True:
+                await asyncio.sleep(1)
+        except asyncio.CancelledError:
+            logger.info("WS event loop cancelled")

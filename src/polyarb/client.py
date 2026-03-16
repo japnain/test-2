@@ -44,7 +44,7 @@ class RateLimiter:
             if self.tokens >= 1:
                 self.tokens -= 1
                 return
-            await asyncio.sleep(0.1)
+            await asyncio.sleep(0.01)
 
 
 class PolymarketClient:
@@ -422,6 +422,45 @@ class PolymarketClient:
             return result
         except Exception as e:
             logger.error(f"Failed to place market sell: {e}")
+            return None
+
+    def get_wallet_address(self) -> str | None:
+        """Derive wallet address from private key."""
+        if not self.config.private_key:
+            return None
+        try:
+            from eth_account import Account
+            acct = Account.from_key(self.config.private_key)
+            return acct.address
+        except Exception:
+            return None
+
+    async def get_wallet_balance(self) -> float | None:
+        """Fetch USDC balance on Polygon (via public RPC)."""
+        address = self.get_wallet_address()
+        if not address:
+            return None
+
+        # USDC.e on Polygon
+        usdc_address = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+        # balanceOf(address) selector
+        data = f"0x70a08231000000000000000000000000{address[2:].lower()}"
+
+        try:
+            rpc_url = "https://polygon-rpc.com"
+            payload = {
+                "jsonrpc": "2.0",
+                "method": "eth_call",
+                "params": [{"to": usdc_address, "data": data}, "latest"],
+                "id": 1,
+            }
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.post(rpc_url, json=payload)
+                result = resp.json().get("result", "0x0")
+                balance_raw = int(result, 16)
+                return balance_raw / 1e6  # USDC has 6 decimals
+        except Exception as e:
+            logger.debug(f"Failed to fetch balance: {e}")
             return None
 
     async def close(self):

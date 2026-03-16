@@ -14,6 +14,9 @@ class ScanningConfig(BaseModel):
     poll_interval_sec: float = 1.0
     market_refresh_sec: float = 120.0
     max_markets: int = 5000
+    use_websocket: bool = True
+    ws_url: str = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+    ws_reconnect_delay_sec: float = 2.0
 
 
 class ArbitrageConfig(BaseModel):
