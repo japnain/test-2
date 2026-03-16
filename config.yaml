@@ -1,0 +1,46 @@
+# Polymarket Arbitrage Bot Configuration
+
+# Mode: "dry_run" (default, no real trades) or "live"
+mode: dry_run
+
+# Polygon chain ID
+chain_id: 137
+
+# API endpoints
+clob_url: "https://clob.polymarket.com"
+gamma_url: "https://gamma-api.polymarket.com"
+
+# Scanning
+scanning:
+  poll_interval_sec: 1.0      # How often to scan (seconds)
+  market_refresh_sec: 120.0   # How often to refresh market list
+  max_markets: 5000           # Maximum markets to track
+
+# Arbitrage detection
+arbitrage:
+  min_profit_bps: 30          # Minimum profit in basis points (0.3%)
+  min_profit_usd: 0.10        # Minimum absolute profit per arb (USD)
+  fee_estimate_pct: 0.02      # Conservative fee estimate (2% of $1 payout)
+  strategies:
+    - multi_outcome            # NegRisk markets with 3+ outcomes
+    - binary                   # YES+NO < $1 dislocations
+
+# Execution
+execution:
+  order_type: FOK              # Fill-or-Kill (no partial fills)
+  max_order_usd: 100.0         # Max USD per leg
+  max_slippage_bps: 10         # Max acceptable price slippage
+  verify_before_execute: true  # Re-check order book before each leg
+
+# Risk management
+risk:
+  max_position_usd: 500.0     # Max total exposure
+  max_open_positions: 10       # Max simultaneous arb positions
+  max_daily_loss_usd: 50.0    # Daily loss limit — halts trading if hit
+  cooldown_after_fail_sec: 30  # Pause after failed execution
+  kill_switch: false           # Emergency halt — set true to stop all trading
+
+# Logging
+logging:
+  level: INFO
+  trade_log: "logs/trades.jsonl"
