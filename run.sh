@@ -42,25 +42,46 @@ echo ""
 info "Checking Python..."
 
 PYTHON=""
-for cmd in python3 python; do
+MIN_MINOR=9  # Minimum Python 3.9
+
+# Check common Python command names (including Homebrew-specific versions)
+for cmd in python3.13 python3.12 python3.11 python3.10 python3.9 python3 python; do
     if command -v "$cmd" &>/dev/null; then
         ver=$("$cmd" -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')" 2>/dev/null || echo "0.0")
         major=$("$cmd" -c "import sys; print(sys.version_info.major)" 2>/dev/null || echo "0")
         minor=$("$cmd" -c "import sys; print(sys.version_info.minor)" 2>/dev/null || echo "0")
-        if [ "$major" -ge 3 ] && [ "$minor" -ge 11 ]; then
+        if [ "$major" -ge 3 ] && [ "$minor" -ge "$MIN_MINOR" ]; then
             PYTHON="$cmd"
             break
         fi
     fi
 done
 
+# Also check Homebrew paths directly (Mac)
 if [ -z "$PYTHON" ]; then
-    fail "Python 3.11 or higher is required but was not found."
+    for brew_py in /opt/homebrew/bin/python3 /usr/local/bin/python3 /opt/homebrew/bin/python3.12 /opt/homebrew/bin/python3.11 /opt/homebrew/bin/python3.10 /opt/homebrew/bin/python3.9; do
+        if [ -x "$brew_py" ]; then
+            ver=$("$brew_py" -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')" 2>/dev/null || echo "0.0")
+            major=$("$brew_py" -c "import sys; print(sys.version_info.major)" 2>/dev/null || echo "0")
+            minor=$("$brew_py" -c "import sys; print(sys.version_info.minor)" 2>/dev/null || echo "0")
+            if [ "$major" -ge 3 ] && [ "$minor" -ge "$MIN_MINOR" ]; then
+                PYTHON="$brew_py"
+                break
+            fi
+        fi
+    done
+fi
+
+if [ -z "$PYTHON" ]; then
+    fail "Python 3.9 or higher is required but was not found."
     echo ""
     echo -e "  ${BOLD}How to install Python:${NC}"
-    echo "    Ubuntu/Debian:  sudo apt install python3.11"
-    echo "    Mac (Homebrew): brew install python@3.11"
+    echo "    Mac (Homebrew): brew install python@3.12"
+    echo "    Ubuntu/Debian:  sudo apt install python3"
     echo "    Other:          https://www.python.org/downloads/"
+    echo ""
+    echo -e "  ${BOLD}Already installed?${NC} Check with: python3 --version"
+    echo "  If Homebrew installed it, try: /opt/homebrew/bin/python3 --version"
     echo ""
     exit 1
 fi
