@@ -67,7 +67,7 @@ class PolymarketClient:
         )
 
         # Rate limiters
-        self._public_limiter = RateLimiter(max_requests=80, per_seconds=60)
+        self._public_limiter = RateLimiter(max_requests=200, per_seconds=60)
         self._order_limiter = RateLimiter(max_requests=50, per_seconds=60)
 
     def _get_clob(self) -> ClobClient:

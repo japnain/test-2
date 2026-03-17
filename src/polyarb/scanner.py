@@ -83,26 +83,31 @@ class MarketScanner:
         self, event: EventMarket
     ) -> dict[str, OrderBookSnapshot]:
         """Fetch order books for all outcomes of an event."""
+        token_ids = [o.token_id for o in event.outcomes]
+
         # If WS mirror has data, use it (near-zero latency)
         if self._ws_mode and self.ws_mirror:
-            token_ids = [o.token_id for o in event.outcomes]
             mirror_books = self.ws_mirror.get_all(token_ids)
-            # Check if we have all tokens and they're not stale
-            if len(mirror_books) == len(token_ids):
-                all_fresh = all(
-                    not self.ws_mirror.is_stale(tid) for tid in token_ids
-                )
-                if all_fresh:
-                    return mirror_books
+            # Use mirror data if we have ANY tokens (partial is fine)
+            if mirror_books:
+                fresh_books = {
+                    tid: book for tid, book in mirror_books.items()
+                    if not self.ws_mirror.is_stale(tid)
+                }
+                if fresh_books:
+                    return fresh_books
 
         # Fallback to HTTP fetch
-        token_ids = [o.token_id for o in event.outcomes]
         return await self.client.get_order_books_batch(token_ids)
 
     async def scan_once(
         self,
     ) -> list[tuple[EventMarket, dict[str, OrderBookSnapshot]]]:
-        """Run a single scan cycle. Returns events with their order books."""
+        """Run a single scan cycle. Returns events with their order books.
+
+        Scans a rotating batch of events per cycle (not all at once) to keep
+        each cycle fast. Uses concurrent fetches within each batch.
+        """
         start = time.monotonic()
         now = time.time()
 
@@ -114,24 +119,42 @@ class MarketScanner:
             await self.refresh_markets()
 
         results = []
+        batch_size = 50  # Events per scan cycle
+        concurrency = 10  # Max concurrent HTTP fetches
+        sem = asyncio.Semaphore(concurrency)
 
-        # Fetch order books for NegRisk events (primary strategy)
-        if "multi_outcome" in self.config.arbitrage.strategies:
-            for event in self.neg_risk_events:
-                try:
-                    books = await self.fetch_event_books(event)
-                    results.append((event, books))
-                except Exception as e:
-                    logger.error(f"Error scanning event {event.event_id}: {e}")
+        async def _fetch_with_sem(event: EventMarket):
+            async with sem:
+                return event, await self.fetch_event_books(event)
 
-        # Fetch order books for binary events (secondary strategy)
-        if "binary" in self.config.arbitrage.strategies:
-            for event in self.binary_events:
-                try:
-                    books = await self.fetch_event_books(event)
-                    results.append((event, books))
-                except Exception as e:
-                    logger.error(f"Error scanning binary {event.event_id}: {e}")
+        # Build list of events to scan this cycle (rotating batch)
+        events_to_scan = []
+
+        if "multi_outcome" in self.config.arbitrage.strategies and self.neg_risk_events:
+            n = len(self.neg_risk_events)
+            start_idx = (self.scan_count * batch_size) % n
+            events_to_scan.extend(
+                self.neg_risk_events[start_idx:start_idx + batch_size]
+            )
+
+        if "binary" in self.config.arbitrage.strategies and self.binary_events:
+            n = len(self.binary_events)
+            start_idx = (self.scan_count * batch_size) % n
+            events_to_scan.extend(
+                self.binary_events[start_idx:start_idx + batch_size]
+            )
+
+        # Fetch all books concurrently
+        if events_to_scan:
+            tasks = [_fetch_with_sem(event) for event in events_to_scan]
+            completed = await asyncio.gather(*tasks, return_exceptions=True)
+            for result in completed:
+                if isinstance(result, Exception):
+                    logger.error(f"Error scanning event: {result}")
+                else:
+                    event, books = result
+                    if books:
+                        results.append((event, books))
 
         self.scan_count += 1
         self.last_scan_latency_ms = (time.monotonic() - start) * 1000
