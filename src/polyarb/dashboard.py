@@ -13,6 +13,7 @@ from rich.table import Table
 from rich.text import Text
 
 from polyarb.config import Config
+from polyarb.executor import Executor
 from polyarb.risk import RiskManager
 from polyarb.scanner import MarketScanner
 from polyarb.tracker import PnLTracker
@@ -37,12 +38,14 @@ class Dashboard:
         tracker: PnLTracker,
         risk: RiskManager,
         ws_client=None,
+        executor: Executor | None = None,
     ):
         self.config = config
         self.scanner = scanner
         self.tracker = tracker
         self.risk = risk
         self.ws_client = ws_client
+        self.executor = executor
         self.console = Console()
         self._start_time = time.time()
 
@@ -67,12 +70,17 @@ class Dashboard:
         if self.config.is_live:
             mode = Text("  ⚡ LIVE TRADING  ", style="bold white on red")
         else:
-            mode = Text("  🔒 DRY RUN  ", style="bold white on blue")
+            mode = Text("  📊 SIMULATION  ", style="bold white on green")
 
         status_line = Text()
         status_line.append_text(mode)
         status_line.append(f"  │  Uptime: {self._uptime_str()}")
         status_line.append(f"  │  {datetime.now().strftime('%H:%M:%S')}")
+
+        # Show balance
+        if self.executor and self.config.is_dry_run:
+            balance = self.executor._get_sim_balance()
+            status_line.append(f"  │  Balance: ${balance:.2f}")
         parts.append(status_line)
         parts.append(Text("━" * 60, style="cyan"))
 
@@ -174,6 +182,7 @@ class Dashboard:
         risk_parts.append(f"Positions: [bold]{risk_s['open_positions']}[/]")
         risk_parts.append(f"Daily P&L: [green]+${risk_s['daily_profit_usd']:.2f}[/]")
         risk_parts.append(f"Daily Loss: [red]-${risk_s['daily_loss_usd']:.2f}[/]")
+        risk_parts.append(f"Unrealized: [cyan]+${risk_s['unrealized_pnl']:.2f}[/]")
         if risk_s["in_cooldown"]:
             risk_parts.append("[bold red]COOLDOWN[/]")
         if risk_s["kill_switch"]:

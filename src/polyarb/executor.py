@@ -2,6 +2,9 @@
 
 RULE: Only executes if profit is mathematically guaranteed after gas costs.
 Pre-trade verification: re-checks order books before every leg.
+
+In dry-run mode, the full pipeline runs identically to live mode — gas checks,
+order book verification, risk checks — but order placement is simulated.
 """
 
 from __future__ import annotations
@@ -9,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+import uuid
 
 from polyarb.client import PolymarketClient
 from polyarb.config import Config
@@ -24,22 +28,29 @@ class Executor:
     def __init__(self, client: PolymarketClient, config: Config):
         self.client = client
         self.config = config
+        # Track simulated balance in dry-run mode
+        self._sim_balance: float | None = None
+
+    def _get_sim_balance(self) -> float:
+        """Get simulated balance (initialized from max_position_usd)."""
+        if self._sim_balance is None:
+            self._sim_balance = self.config.risk.max_position_usd
+        return self._sim_balance
 
     async def execute(self, opp: ArbOpportunity) -> TradeResult:
         """Execute an arbitrage opportunity.
 
-        Strategy:
+        In both live AND dry-run mode, the full pipeline runs:
         1. Check that profit exceeds gas costs
-        2. Sort legs by liquidity (thinnest first)
-        3. Execute legs sequentially or in parallel (configurable)
-        4. If any leg fails, use smart exit for already-filled positions
-        5. Only count as success if ALL legs fill
+        2. Check simulated balance (dry-run) or real balance (live)
+        3. Re-verify order books before execution
+        4. Execute legs sequentially or in parallel
+        5. If any leg fails, use smart exit for already-filled positions
+        6. Only count as success if ALL legs fill
         """
-        if self.config.is_dry_run:
-            return self._simulate(opp)
-
-        # Gas cost check
         num_legs = len(opp.token_ids)
+
+        # Gas cost check (runs in ALL modes)
         total_gas = self.config.execution.gas_cost_per_leg_usd * num_legs
         if opp.estimated_profit_usd <= total_gas:
             logger.info(
@@ -59,7 +70,29 @@ class Executor:
                 error=f"Profit ${opp.estimated_profit_usd:.2f} does not cover gas ${total_gas:.2f}",
             )
 
-        # Pre-trade verification: re-fetch all order books
+        # Balance check (dry-run uses simulated balance)
+        trade_cost = opp.net_cost * opp.optimal_shares
+        if self.config.is_dry_run:
+            balance = self._get_sim_balance()
+            if trade_cost > balance:
+                logger.info(
+                    f"[SIM] Insufficient balance: need ${trade_cost:.2f}, "
+                    f"have ${balance:.2f}"
+                )
+                return TradeResult(
+                    opportunity=opp,
+                    status="failed",
+                    legs_filled=0,
+                    legs_total=num_legs,
+                    order_ids=[],
+                    actual_prices=[],
+                    total_cost_actual=0,
+                    shares_filled=0,
+                    expected_profit_usd=0,
+                    error=f"Insufficient balance: ${balance:.2f} < ${trade_cost:.2f}",
+                )
+
+        # Pre-trade verification: re-fetch all order books (runs in ALL modes)
         if self.config.execution.verify_before_execute:
             still_valid = await self._verify_opportunity(opp)
             if not still_valid:
@@ -77,14 +110,24 @@ class Executor:
                     error="Opportunity no longer valid on re-check",
                 )
 
+        # Execute (dry-run simulates order fills, live places real orders)
         if self.config.execution.parallel_execution:
-            return await self._execute_parallel(opp)
+            result = await self._execute_parallel(opp)
         else:
-            return await self._execute_sequential(opp)
+            result = await self._execute_sequential(opp)
+
+        # Update simulated balance on success
+        if self.config.is_dry_run and result.status == "all_filled":
+            self._sim_balance = self._get_sim_balance() - result.total_cost_actual
+            logger.info(
+                f"[SIM] Balance: ${self._sim_balance:.2f} "
+                f"(spent ${result.total_cost_actual:.2f})"
+            )
+
+        return result
 
     async def _execute_sequential(self, opp: ArbOpportunity) -> TradeResult:
         """Execute legs sequentially (thinnest liquidity first)."""
-        # Sort legs by liquidity (thinnest first = least risky to try first)
         leg_order = sorted(
             range(len(opp.token_ids)),
             key=lambda i: opp.fill_sizes[i],
@@ -99,25 +142,29 @@ class Executor:
             price = opp.fill_prices[leg_idx]
             size = opp.optimal_shares
 
+            mode_tag = "[SIM]" if self.config.is_dry_run else ""
             logger.info(
-                f"Executing leg {leg_idx + 1}/{len(opp.token_ids)}: "
+                f"{mode_tag} Executing leg {leg_idx + 1}/{len(opp.token_ids)}: "
                 f"BUY {size:.1f} shares of '{opp.outcomes[leg_idx]}' at ${price:.4f}"
             )
 
-            result = await self._place_order_with_timeout(
-                token_id=token_id,
-                price=price,
-                size=size,
-                neg_risk=opp.neg_risk,
-            )
+            if self.config.is_dry_run:
+                result = self._simulate_order(token_id, price, size)
+            else:
+                result = await self._place_order_with_timeout(
+                    token_id=token_id,
+                    price=price,
+                    size=size,
+                    neg_risk=opp.neg_risk,
+                )
 
             if result and self._is_filled(result):
                 order_ids[leg_idx] = self._extract_order_id(result)
                 actual_prices[leg_idx] = price
                 filled_legs.append(leg_idx)
-                logger.info(f"Leg {leg_idx + 1} FILLED")
+                logger.info(f"{mode_tag} Leg {leg_idx + 1} FILLED")
             else:
-                logger.warning(f"Leg {leg_idx + 1} FAILED — aborting remaining legs")
+                logger.warning(f"{mode_tag} Leg {leg_idx + 1} FAILED — aborting remaining legs")
                 break
 
         return self._build_result(opp, order_ids, actual_prices, filled_legs)
@@ -128,36 +175,47 @@ class Executor:
         actual_prices: list[float | None] = [None] * len(opp.token_ids)
         filled_legs: list[int] = []
 
+        mode_tag = "[SIM]" if self.config.is_dry_run else ""
         logger.info(
-            f"Parallel execution: {len(opp.token_ids)} legs for '{opp.event_title}'"
+            f"{mode_tag} Parallel execution: {len(opp.token_ids)} legs for '{opp.event_title}'"
         )
 
-        async def _execute_leg(idx: int):
-            token_id = opp.token_ids[idx]
-            price = opp.fill_prices[idx]
-            size = opp.optimal_shares
-            return idx, await self._place_order_with_timeout(
-                token_id=token_id,
-                price=price,
-                size=size,
-                neg_risk=opp.neg_risk,
-            )
+        if self.config.is_dry_run:
+            # Simulate all legs filling
+            for i in range(len(opp.token_ids)):
+                result = self._simulate_order(opp.token_ids[i], opp.fill_prices[i], opp.optimal_shares)
+                if result and self._is_filled(result):
+                    order_ids[i] = self._extract_order_id(result)
+                    actual_prices[i] = opp.fill_prices[i]
+                    filled_legs.append(i)
+                    logger.info(f"[SIM] Leg {i + 1} FILLED (parallel)")
+        else:
+            async def _execute_leg(idx: int):
+                token_id = opp.token_ids[idx]
+                price = opp.fill_prices[idx]
+                size = opp.optimal_shares
+                return idx, await self._place_order_with_timeout(
+                    token_id=token_id,
+                    price=price,
+                    size=size,
+                    neg_risk=opp.neg_risk,
+                )
 
-        tasks = [_execute_leg(i) for i in range(len(opp.token_ids))]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+            tasks = [_execute_leg(i) for i in range(len(opp.token_ids))]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        for result in results:
-            if isinstance(result, Exception):
-                logger.error(f"Parallel leg error: {result}")
-                continue
-            idx, order_result = result
-            if order_result and self._is_filled(order_result):
-                order_ids[idx] = self._extract_order_id(order_result)
-                actual_prices[idx] = opp.fill_prices[idx]
-                filled_legs.append(idx)
-                logger.info(f"Leg {idx + 1} FILLED (parallel)")
-            else:
-                logger.warning(f"Leg {idx + 1} FAILED (parallel)")
+            for result in results:
+                if isinstance(result, Exception):
+                    logger.error(f"Parallel leg error: {result}")
+                    continue
+                idx, order_result = result
+                if order_result and self._is_filled(order_result):
+                    order_ids[idx] = self._extract_order_id(order_result)
+                    actual_prices[idx] = opp.fill_prices[idx]
+                    filled_legs.append(idx)
+                    logger.info(f"Leg {idx + 1} FILLED (parallel)")
+                else:
+                    logger.warning(f"Leg {idx + 1} FAILED (parallel)")
 
         return self._build_result(opp, order_ids, actual_prices, filled_legs)
 
@@ -171,13 +229,14 @@ class Executor:
         """Build TradeResult and handle partial fills."""
         num_legs = len(opp.token_ids)
         gas_cost = self.config.execution.gas_cost_per_leg_usd * len(filled_legs)
+        mode_tag = "[SIM]" if self.config.is_dry_run else ""
 
         if len(filled_legs) == num_legs:
             total_cost = sum(p for p in actual_prices if p is not None) * opp.optimal_shares
             profit_after_gas = opp.estimated_profit_usd - gas_cost
             status = "all_filled"
             logger.info(
-                f"ARB EXECUTED: {opp.event_title} | "
+                f"{mode_tag} ARB EXECUTED: {opp.event_title} | "
                 f"All {num_legs} legs filled | "
                 f"Cost=${total_cost:.2f} | "
                 f"Profit after gas=${profit_after_gas:.2f}"
@@ -196,11 +255,13 @@ class Executor:
 
         if filled_legs:
             logger.warning(
-                f"PARTIAL FILL: {len(filled_legs)}/{num_legs} legs. "
+                f"{mode_tag} PARTIAL FILL: {len(filled_legs)}/{num_legs} legs. "
                 f"Attempting smart exit..."
             )
-            # Use smart exit instead of blind market sell
-            asyncio.ensure_future(self._smart_exit_partial(opp, filled_legs, opp.optimal_shares))
+            if not self.config.is_dry_run:
+                asyncio.ensure_future(self._smart_exit_partial(opp, filled_legs, opp.optimal_shares))
+            else:
+                logger.info("[SIM] Would attempt smart exit for partial fill")
             total_cost = sum(
                 (actual_prices[i] or 0) * opp.optimal_shares for i in filled_legs
             )
@@ -227,6 +288,22 @@ class Executor:
             shares_filled=0,
             expected_profit_usd=0,
         )
+
+    def _simulate_order(
+        self, token_id: str, price: float, size: float
+    ) -> dict:
+        """Simulate an order fill for dry-run mode.
+
+        Returns a result dict that looks like a real Polymarket fill.
+        """
+        return {
+            "status": "MATCHED",
+            "orderID": f"sim_{uuid.uuid4().hex[:12]}",
+            "price": str(price),
+            "size": str(size),
+            "token_id": token_id,
+            "simulated": True,
+        }
 
     async def _place_order_with_timeout(
         self,
@@ -293,7 +370,6 @@ class Executor:
             entry_price = opp.fill_prices[leg_idx]
 
             try:
-                # Fetch current order book to check bid side
                 book = await self.client.get_order_book(token_id)
 
                 if not book.bids:
@@ -315,8 +391,7 @@ class Executor:
                     )
                     continue
 
-                # Place limit sell slightly below best bid for faster fill
-                sell_price = best_bid * 0.999  # 0.1% below best bid
+                sell_price = best_bid * 0.999
                 logger.info(
                     f"Smart exit: selling {shares:.1f} shares of "
                     f"'{opp.outcomes[leg_idx]}' at ${sell_price:.4f} "
@@ -330,30 +405,6 @@ class Executor:
                 logger.error(
                     f"Failed to exit partial position {opp.outcomes[leg_idx]}: {e}"
                 )
-
-    def _simulate(self, opp: ArbOpportunity) -> TradeResult:
-        """Simulate execution in dry-run mode (includes gas cost deduction)."""
-        num_legs = len(opp.token_ids)
-        gas_cost = self.config.execution.gas_cost_per_leg_usd * num_legs
-        profit_after_gas = opp.estimated_profit_usd - gas_cost
-
-        logger.info(
-            f"[DRY RUN] Would execute: {opp.event_title} | "
-            f"{num_legs} legs | "
-            f"cost=${opp.total_cost:.4f}/share | "
-            f"profit=${profit_after_gas:.2f} (after ${gas_cost:.2f} gas)"
-        )
-        return TradeResult(
-            opportunity=opp,
-            status="dry_run",
-            legs_filled=num_legs,
-            legs_total=num_legs,
-            order_ids=[None] * num_legs,
-            actual_prices=opp.fill_prices,
-            total_cost_actual=opp.total_cost * opp.optimal_shares,
-            shares_filled=opp.optimal_shares,
-            expected_profit_usd=profit_after_gas,
-        )
 
     @staticmethod
     def _is_filled(result: dict) -> bool:

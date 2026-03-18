@@ -59,7 +59,11 @@ class PnLTracker:
             self.opportunities_log = self.opportunities_log[-50:]
 
     def record_trade(self, result: TradeResult):
-        """Log a trade execution result."""
+        """Log a trade execution result.
+
+        In dry-run mode, trades come through as 'all_filled' (same as live)
+        since the executor now runs the full pipeline with simulated orders.
+        """
         self.total_trades += 1
 
         if result.status == "all_filled":
@@ -69,6 +73,7 @@ class PnLTracker:
         elif result.status == "partial":
             self.partial_trades += 1
         elif result.status == "dry_run":
+            # Legacy compat — should not happen with new executor
             self.dry_run_trades += 1
             self.total_expected_profit += result.expected_profit_usd
         else:

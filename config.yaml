@@ -32,7 +32,7 @@ arbitrage:
 # Execution
 execution:
   order_type: FOK              # Fill-or-Kill (no partial fills)
-  max_order_usd: 100.0         # Max USD per leg
+  max_order_usd: 25.0          # Max USD per leg
   max_slippage_bps: 10         # Max acceptable price slippage
   verify_before_execute: true  # Re-check order book before each leg
   parallel_execution: false    # Execute legs in parallel (faster but riskier)
@@ -42,9 +42,9 @@ execution:
 
 # Risk management
 risk:
-  max_position_usd: 500.0     # Max total exposure
-  max_open_positions: 10       # Max simultaneous arb positions
-  max_daily_loss_usd: 50.0    # Daily loss limit — halts trading if hit
+  max_position_usd: 50.0      # Max total exposure ($50 balance)
+  max_open_positions: 5        # Max simultaneous arb positions
+  max_daily_loss_usd: 25.0    # Daily loss limit — halts trading if hit
   cooldown_after_fail_sec: 30  # Pause after failed execution
   kill_switch: false           # Emergency halt — set true to stop all trading
 

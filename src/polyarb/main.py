@@ -60,7 +60,8 @@ class ArbBot:
         self.ws_mirror = None
 
         self.dashboard = Dashboard(
-            self.config, self.scanner, self.tracker, self.risk
+            self.config, self.scanner, self.tracker, self.risk,
+            executor=self.executor,
         )
 
     async def _init_websocket(self):
