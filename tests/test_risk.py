@@ -24,12 +24,13 @@ def make_opp(
     profit: float = 0.05,
     shares: float = 10.0,
     fill_prices: list[float] | None = None,
+    event_id: str = "test",
 ) -> ArbOpportunity:
     if fill_prices is None:
         fill_prices = [0.30, 0.30, 0.30]
     total_cost = sum(fill_prices)
     return ArbOpportunity(
-        event_id="test",
+        event_id=event_id,
         event_title="Test Event",
         outcomes=["A", "B", "C"],
         token_ids=["t1", "t2", "t3"],
@@ -166,3 +167,70 @@ class TestRiskManager:
         assert "open_positions" in summary
         assert "daily_profit_usd" in summary
         assert "kill_switch" in summary
+        assert "unrealized_pnl" in summary
+
+    def test_position_tracking_on_fill(self):
+        """Verify positions are tracked when trades fill."""
+        risk = RiskManager(make_config())
+        opp = make_opp(profit=0.05, shares=10, event_id="event_1")
+        result = TradeResult(
+            opportunity=opp,
+            status="all_filled",
+            legs_filled=3,
+            legs_total=3,
+            order_ids=["o1", "o2", "o3"],
+            actual_prices=[0.30, 0.30, 0.30],
+            total_cost_actual=9.0,
+            shares_filled=10,
+            expected_profit_usd=0.50,
+        )
+        risk.record_trade(result)
+
+        assert "event_1" in risk.positions
+        pos = risk.positions["event_1"]
+        assert pos.shares == 10
+        assert pos.expected_profit == 0.50
+
+    def test_unrealized_pnl(self):
+        """Verify unrealized P&L is tracked from open positions."""
+        risk = RiskManager(make_config())
+
+        # Add two positions
+        for i, profit in enumerate([0.50, 0.30]):
+            opp = make_opp(profit=0.05, shares=10, event_id=f"event_{i}")
+            result = TradeResult(
+                opportunity=opp,
+                status="all_filled",
+                legs_filled=3,
+                legs_total=3,
+                order_ids=["o1", "o2", "o3"],
+                actual_prices=[0.30, 0.30, 0.30],
+                total_cost_actual=9.0,
+                shares_filled=10,
+                expected_profit_usd=profit,
+            )
+            risk.record_trade(result)
+
+        assert risk.get_unrealized_pnl() == pytest.approx(0.80)
+
+    def test_resolution_removes_position(self):
+        """Verify resolution removes tracked position."""
+        risk = RiskManager(make_config())
+        opp = make_opp(profit=0.05, shares=10, event_id="event_1")
+        result = TradeResult(
+            opportunity=opp,
+            status="all_filled",
+            legs_filled=3,
+            legs_total=3,
+            order_ids=["o1", "o2", "o3"],
+            actual_prices=[0.30, 0.30, 0.30],
+            total_cost_actual=9.0,
+            shares_filled=10,
+            expected_profit_usd=0.50,
+        )
+        risk.record_trade(result)
+        assert "event_1" in risk.positions
+
+        risk.record_resolution("event_1", 0.50)
+        assert "event_1" not in risk.positions
+        assert risk.open_positions == 0

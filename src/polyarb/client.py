@@ -70,6 +70,11 @@ class PolymarketClient:
         self._public_limiter = RateLimiter(max_requests=200, per_seconds=60)
         self._order_limiter = RateLimiter(max_requests=50, per_seconds=60)
 
+        # Fee rate cache
+        self._cached_fee_rate: float | None = None
+        self._fee_rate_fetched_at: float = 0.0
+        self._fee_rate_ttl: float = 300.0  # 5 minutes
+
     def _get_clob(self) -> ClobClient:
         """Lazy-init the CLOB client."""
         if self._clob is None:
@@ -462,6 +467,40 @@ class PolymarketClient:
         except Exception as e:
             logger.debug(f"Failed to fetch balance: {e}")
             return None
+
+    async def get_fee_rate(self) -> float:
+        """Query CLOB API for actual fee rate, with caching.
+
+        Returns the fee rate as a decimal (e.g., 0.02 for 2%).
+        Falls back to config value if the API call fails.
+        """
+        now = time.monotonic()
+        if (
+            self._cached_fee_rate is not None
+            and now - self._fee_rate_fetched_at < self._fee_rate_ttl
+        ):
+            return self._cached_fee_rate
+
+        try:
+            await self._public_limiter.acquire()
+            clob = self._get_clob()
+            # Try to get tick sizes / fee info from the CLOB API
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.get(f"{self.config.clob_url}/tick-size")
+                if resp.status_code == 200:
+                    data = resp.json()
+                    # Look for maker/taker fee fields
+                    taker_fee = data.get("taker_fee") or data.get("fee_rate")
+                    if taker_fee is not None:
+                        self._cached_fee_rate = float(taker_fee)
+                        self._fee_rate_fetched_at = now
+                        logger.info(f"Fee rate from API: {self._cached_fee_rate}")
+                        return self._cached_fee_rate
+        except Exception as e:
+            logger.debug(f"Failed to fetch fee rate from API: {e}")
+
+        # Fallback to config value
+        return self.config.arbitrage.fee_estimate_pct
 
     async def close(self):
         """Clean up resources."""

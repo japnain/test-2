@@ -23,6 +23,7 @@ class ArbitrageConfig(BaseModel):
     min_profit_bps: float = 30.0
     min_profit_usd: float = 0.10
     fee_estimate_pct: float = 0.02
+    safety_margin_pct: float = 0.005
     strategies: list[str] = Field(default_factory=lambda: ["multi_outcome", "binary"])
 
 
@@ -31,6 +32,10 @@ class ExecutionConfig(BaseModel):
     max_order_usd: float = 100.0
     max_slippage_bps: float = 10.0
     verify_before_execute: bool = True
+    parallel_execution: bool = False
+    execution_timeout_sec: float = 10.0
+    gas_cost_per_leg_usd: float = 0.01
+    max_exit_slippage_pct: float = 0.05
 
 
 class RiskConfig(BaseModel):

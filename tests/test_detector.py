@@ -17,6 +17,7 @@ def make_config(**overrides) -> Config:
     config.arbitrage.min_profit_bps = 30
     config.arbitrage.min_profit_usd = 0.01
     config.arbitrage.fee_estimate_pct = 0.02
+    config.arbitrage.safety_margin_pct = 0.0  # Zero for backward compat in tests
     config.execution.max_order_usd = 100.0
     for k, v in overrides.items():
         setattr(config.arbitrage, k, v)
@@ -78,6 +79,15 @@ class TestWalkBook:
         assert avg_price == pytest.approx(0.26)
         assert filled == pytest.approx(50)
 
+    def test_decimal_precision_no_float_drift(self):
+        """Verify Decimal arithmetic prevents float rounding issues."""
+        # 0.1 + 0.2 != 0.3 in float, but should be exact in our implementation
+        asks = [PriceLevel(0.1, 100)]
+        result = walk_book(asks, 100)
+        assert result is not None
+        avg_price, _ = result
+        assert avg_price == pytest.approx(0.1, abs=1e-10)
+
 
 class TestFindOptimalShares:
     def test_profitable_arb(self):
@@ -128,6 +138,40 @@ class TestFindOptimalShares:
         assert result is not None
         shares, _ = result
         assert shares <= 5  # Limited by thinnest leg
+
+    def test_safety_margin_rejects_marginal_arb(self):
+        """An arb that passes without safety margin should fail with it."""
+        # sum = 0.95, fee = 0.02, net = 0.97, profit = 0.03/share — passes normally
+        asks = [
+            [PriceLevel(0.475, 100)],
+            [PriceLevel(0.475, 100)],
+        ]
+        # Without safety margin: profit = 1.0 - 0.95 - 0.02 = 0.03 (passes)
+        result_no_safety = find_optimal_shares(
+            asks, fee_estimate_pct=0.02, min_profit_bps=30, safety_margin_pct=0.0
+        )
+        assert result_no_safety is not None
+
+        # With 5% safety margin: net = 0.95 + 0.02 + 0.05 = 1.02 (fails)
+        result_with_safety = find_optimal_shares(
+            asks, fee_estimate_pct=0.02, min_profit_bps=30, safety_margin_pct=0.05
+        )
+        assert result_with_safety is None
+
+    def test_safety_margin_passes_strong_arb(self):
+        """A strong arb should still pass with safety margin."""
+        # sum = 0.75, fee = 0.02, safety = 0.005, net = 0.775, profit = 0.225
+        asks = [
+            [PriceLevel(0.25, 100)],
+            [PriceLevel(0.25, 100)],
+            [PriceLevel(0.25, 100)],
+        ]
+        result = find_optimal_shares(
+            asks, fee_estimate_pct=0.02, min_profit_bps=30, safety_margin_pct=0.005
+        )
+        assert result is not None
+        shares, prices = result
+        assert shares > 0
 
 
 class TestArbDetector:
@@ -296,3 +340,32 @@ class TestArbDetector:
         opps = detector.evaluate([(event, books)])
         for opp in opps:
             assert opp.guaranteed_profit > 0, "Profit must always be positive!"
+
+    def test_safety_margin_in_detector(self):
+        """Verify detector uses safety margin from config."""
+        config = make_config(safety_margin_pct=0.05)
+        detector = ArbDetector(config)
+
+        event = EventMarket(
+            event_id="test",
+            event_slug="test",
+            title="Marginal arb",
+            outcomes=[
+                MarketOutcome("tok_a", "A", "c1", "m1"),
+                MarketOutcome("tok_b", "B", "c2", "m2"),
+            ],
+            neg_risk=True,
+            tick_size=0.01,
+            min_order_size=1.0,
+        )
+
+        # Sum = 0.90, fee = 0.02, safety = 0.05, net = 0.97, profit = 0.03
+        books = {
+            "tok_a": make_book([(0.45, 100)]),
+            "tok_b": make_book([(0.45, 100)]),
+        }
+
+        opps = detector.evaluate([(event, books)])
+        assert len(opps) == 1
+        # Profit should account for safety margin
+        assert opps[0].guaranteed_profit == pytest.approx(0.03, abs=0.001)

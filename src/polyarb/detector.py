@@ -1,12 +1,13 @@
 """Arbitrage detection engine — THE CORE.
 
 RULE: No trade is EVER placed unless profit is mathematically guaranteed.
+Uses Decimal arithmetic to prevent float rounding errors on marginal trades.
 """
 
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from decimal import Decimal, ROUND_DOWN, getcontext
 
 from polyarb.config import Config
 from polyarb.models import (
@@ -18,39 +19,53 @@ from polyarb.models import (
 
 logger = logging.getLogger(__name__)
 
+# Set Decimal precision for price calculations
+getcontext().prec = 18
+
+ONE = Decimal("1.0")
+
+
+def _to_decimal(value: float) -> Decimal:
+    """Convert float to Decimal with string intermediary to avoid float artifacts."""
+    return Decimal(str(value))
+
 
 def walk_book(asks: list[PriceLevel], target_shares: float) -> tuple[float, float] | None:
     """Walk the order book to find actual fill price for target_shares.
 
     Returns (average_fill_price, fillable_shares) or None if no liquidity.
     Accounts for partial fills at each price level.
+    Uses Decimal internally for precision, returns floats for compatibility.
     """
     if not asks or target_shares <= 0:
         return None
 
-    total_cost = 0.0
-    shares_filled = 0.0
+    d_target = _to_decimal(target_shares)
+    total_cost = Decimal("0")
+    shares_filled = Decimal("0")
 
     for level in asks:
-        available = level.size
-        needed = target_shares - shares_filled
-        fill_at_level = min(available, needed)
-        total_cost += fill_at_level * level.price
+        d_price = _to_decimal(level.price)
+        d_available = _to_decimal(level.size)
+        needed = d_target - shares_filled
+        fill_at_level = min(d_available, needed)
+        total_cost += fill_at_level * d_price
         shares_filled += fill_at_level
-        if shares_filled >= target_shares:
+        if shares_filled >= d_target:
             break
 
     if shares_filled <= 0:
         return None
 
     avg_price = total_cost / shares_filled
-    return avg_price, shares_filled
+    return float(avg_price), float(shares_filled)
 
 
 def find_optimal_shares(
     asks_per_outcome: list[list[PriceLevel]],
     fee_estimate_pct: float,
     min_profit_bps: float,
+    safety_margin_pct: float = 0.0,
 ) -> tuple[float, list[float]] | None:
     """Find the optimal number of shares that maximizes total USD profit.
 
@@ -61,6 +76,10 @@ def find_optimal_shares(
     """
     if not asks_per_outcome:
         return None
+
+    d_fee = _to_decimal(fee_estimate_pct)
+    d_safety = _to_decimal(safety_margin_pct)
+    d_min_bps = _to_decimal(min_profit_bps)
 
     # Find the max shares we could possibly fill (limited by thinnest leg)
     max_fillable = []
@@ -73,14 +92,13 @@ def find_optimal_shares(
 
     max_shares = min(max_fillable)
 
-    # Binary search for optimal share count
+    # Test share sizes from small to large
     best_shares = 0.0
-    best_profit = 0.0
+    best_profit = Decimal("0")
     best_prices: list[float] = []
 
-    # Test share sizes from small to large
-    test_sizes = []
     step = max(0.1, max_shares / 100)
+    test_sizes = []
     s = step
     while s <= max_shares:
         test_sizes.append(s)
@@ -91,7 +109,7 @@ def find_optimal_shares(
 
     for test_share in test_sizes:
         prices = []
-        total_cost = 0.0
+        total_cost = Decimal("0")
         valid = True
 
         for asks in asks_per_outcome:
@@ -104,20 +122,21 @@ def find_optimal_shares(
                 valid = False
                 break
             prices.append(avg_price)
-            total_cost += avg_price
+            total_cost += _to_decimal(avg_price)
 
         if not valid:
             break
 
-        # Check profitability at this size
-        net_cost = total_cost + fee_estimate_pct
-        profit_per_share = 1.0 - net_cost
+        # Check profitability at this size (with safety margin)
+        net_cost = total_cost + d_fee + d_safety
+        profit_per_share = ONE - net_cost
 
-        if profit_per_share <= min_profit_bps / 10000:
+        if profit_per_share <= d_min_bps / Decimal("10000"):
             # Not profitable at this depth — stop here
             break
 
-        total_profit = profit_per_share * test_share
+        d_test_share = _to_decimal(test_share)
+        total_profit = profit_per_share * d_test_share
         if total_profit > best_profit:
             best_profit = total_profit
             best_shares = test_share
@@ -164,8 +183,9 @@ class ArbDetector:
     ) -> ArbOpportunity | None:
         """Detect arbitrage in multi-outcome NegRisk markets.
 
-        For an event with N outcomes, if sum of YES ask prices < $1.00 (after fees),
-        buying YES on every outcome guarantees profit since exactly one pays $1.00.
+        For an event with N outcomes, if sum of YES ask prices < $1.00 (after fees
+        and safety margin), buying YES on every outcome guarantees profit since
+        exactly one pays $1.00.
         """
         outcome_labels = []
         token_ids = []
@@ -185,8 +205,9 @@ class ArbDetector:
             asks[0].price for asks in asks_per_outcome if asks
         )
         fee_est = self.config.arbitrage.fee_estimate_pct
+        safety = self.config.arbitrage.safety_margin_pct
 
-        if best_ask_sum + fee_est >= 1.0:
+        if best_ask_sum + fee_est + safety >= 1.0:
             return None  # No arb at best ask level
 
         # Deep analysis: find optimal shares with book walking
@@ -194,14 +215,23 @@ class ArbDetector:
             asks_per_outcome,
             fee_est,
             self.config.arbitrage.min_profit_bps,
+            safety,
         )
         if result is None:
             return None
 
         optimal_shares, fill_prices = result
-        total_cost = sum(fill_prices)
-        net_cost = total_cost + fee_est
-        guaranteed_profit = 1.0 - net_cost
+
+        # Use Decimal for final profit calculation
+        d_total_cost = sum(_to_decimal(p) for p in fill_prices)
+        d_fee = _to_decimal(fee_est)
+        d_safety = _to_decimal(safety)
+        d_net_cost = d_total_cost + d_fee + d_safety
+        d_guaranteed_profit = ONE - d_net_cost
+
+        total_cost = float(d_total_cost)
+        net_cost = float(d_net_cost)
+        guaranteed_profit = float(d_guaranteed_profit)
 
         if guaranteed_profit <= 0:
             return None
@@ -255,7 +285,7 @@ class ArbDetector:
     ) -> ArbOpportunity | None:
         """Detect arbitrage in binary YES/NO markets.
 
-        If YES_ask + NO_ask + fees < $1.00, buying both guarantees profit.
+        If YES_ask + NO_ask + fees + safety < $1.00, buying both guarantees profit.
         Note: This is rare due to shared order books but can happen during volatility.
         """
         if len(event.outcomes) != 2:
@@ -272,10 +302,11 @@ class ArbDetector:
 
         asks_per_outcome = [yes_book.asks, no_book.asks]
         fee_est = self.config.arbitrage.fee_estimate_pct
+        safety = self.config.arbitrage.safety_margin_pct
 
         # Quick check
         best_ask_sum = yes_book.asks[0].price + no_book.asks[0].price
-        if best_ask_sum + fee_est >= 1.0:
+        if best_ask_sum + fee_est + safety >= 1.0:
             return None
 
         # Deep analysis
@@ -283,14 +314,23 @@ class ArbDetector:
             asks_per_outcome,
             fee_est,
             self.config.arbitrage.min_profit_bps,
+            safety,
         )
         if result is None:
             return None
 
         optimal_shares, fill_prices = result
-        total_cost = sum(fill_prices)
-        net_cost = total_cost + fee_est
-        guaranteed_profit = 1.0 - net_cost
+
+        # Use Decimal for final profit calculation
+        d_total_cost = sum(_to_decimal(p) for p in fill_prices)
+        d_fee = _to_decimal(fee_est)
+        d_safety = _to_decimal(safety)
+        d_net_cost = d_total_cost + d_fee + d_safety
+        d_guaranteed_profit = ONE - d_net_cost
+
+        total_cost = float(d_total_cost)
+        net_cost = float(d_net_cost)
+        guaranteed_profit = float(d_guaranteed_profit)
 
         if guaranteed_profit <= 0:
             return None

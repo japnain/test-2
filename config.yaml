@@ -24,6 +24,7 @@ arbitrage:
   min_profit_bps: 30          # Minimum profit in basis points (0.3%)
   min_profit_usd: 0.10        # Minimum absolute profit per arb (USD)
   fee_estimate_pct: 0.02      # Conservative fee estimate (2% of $1 payout)
+  safety_margin_pct: 0.005    # Extra safety buffer on top of fees (0.5%)
   strategies:
     - multi_outcome            # NegRisk markets with 3+ outcomes
     - binary                   # YES+NO < $1 dislocations
@@ -34,6 +35,10 @@ execution:
   max_order_usd: 100.0         # Max USD per leg
   max_slippage_bps: 10         # Max acceptable price slippage
   verify_before_execute: true  # Re-check order book before each leg
+  parallel_execution: false    # Execute legs in parallel (faster but riskier)
+  execution_timeout_sec: 10.0  # Timeout per order placement
+  gas_cost_per_leg_usd: 0.01  # Estimated gas cost per leg on Polygon
+  max_exit_slippage_pct: 0.05 # Max slippage when exiting partial fills (5%)
 
 # Risk management
 risk:
